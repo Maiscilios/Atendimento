@@ -27,20 +27,28 @@ import type {
   PayoutStatus,
 } from './src/shared/panelTypes.ts';
 import {
+  cancelAgendaAppointment,
+  confirmAttendanceReturnToAgenda,
   configureInitialPassword,
+  createAgendaAppointment,
   createSession,
+  deleteAgendaAppointment,
   deleteAttendanceById,
   deleteSession,
+  findConfirmedSlotOwner,
   findUserById,
   findUserByUsername,
+  getAgendaAppointmentById,
   getAllCommissionPayoutsMap,
   getAttendanceById,
   getCommissionPayoutByDate,
   getSessionUser,
   getSetupStatus,
   insertAttendance,
+  listAgendaAppointments,
   queryAttendances,
   resetUserPasswordSetup,
+  updateAgendaAppointment,
   updateAttendanceReturnStatus,
   updateUserPassword,
   upsertCommissionPayoutStatus,
@@ -101,6 +109,10 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
 
 function isValidISODate(value: unknown): value is string {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function isValidManualTime(value: unknown): value is string {
+  return typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 }
 
 function setSessionCookie(req: Request, res: Response, token: string): void {
@@ -661,6 +673,294 @@ async function startServer(): Promise<void> {
   );
 
   // ============================================================================
+  // DUDA AGENDA ROUTES (Strictly scoped to professional = 'duda')
+  // ============================================================================
+  app.get('/api/duda/agenda', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const startDate = isValidISODate(req.query.startDate) ? req.query.startDate : undefined;
+    const endDate = isValidISODate(req.query.endDate) ? req.query.endDate : undefined;
+
+    const appointments = listAgendaAppointments({
+      professional: 'duda',
+      startDate,
+      endDate,
+    });
+
+    res.json({ appointments });
+  });
+
+  app.post(
+    '/api/duda/agenda/appointments',
+    requireAuth,
+    (req: AuthenticatedRequest, res: Response) => {
+      const body = req.body as {
+        clientName?: unknown;
+        whatsapp?: unknown;
+        procedureName?: unknown;
+        appointmentDate?: unknown;
+        appointmentTime?: unknown;
+        notes?: unknown;
+      };
+
+      if (typeof body.clientName !== 'string' || body.clientName.trim().length < 2) {
+        res.status(400).json({ error: 'Informe o nome completo da cliente.' });
+        return;
+      }
+      const clientName = body.clientName.trim().slice(0, 120);
+
+      if (typeof body.whatsapp !== 'string') {
+        res.status(400).json({ error: 'Informe o WhatsApp da cliente.' });
+        return;
+      }
+      const whatsappDigits = extractDigits(body.whatsapp);
+      if (whatsappDigits.length < 10 || whatsappDigits.length > 13) {
+        res.status(400).json({ error: 'Informe o WhatsApp com DDD (10 ou 11 dígitos).' });
+        return;
+      }
+      const whatsapp = formatBrazilPhone(whatsappDigits);
+
+      if (typeof body.procedureName !== 'string' || body.procedureName.trim().length < 2) {
+        res.status(400).json({ error: 'Selecione ou informe o serviço.' });
+        return;
+      }
+      const procedureName = body.procedureName.trim().slice(0, 200);
+
+      if (!isValidISODate(body.appointmentDate)) {
+        res.status(400).json({ error: 'Informe uma data válida.' });
+        return;
+      }
+
+      if (!isValidManualTime(body.appointmentTime)) {
+        res.status(400).json({ error: 'Digite um horário válido no formato HH:MM (ex: 14:30).' });
+        return;
+      }
+
+      const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 500) : '';
+
+      const occupant = findConfirmedSlotOwner(
+        'duda',
+        body.appointmentDate,
+        body.appointmentTime
+      );
+      if (occupant) {
+        res.status(409).json({
+          error: `Horário duplicado: ${occupant.clientName} já possui agendamento confirmado neste dia às ${body.appointmentTime}.`,
+        });
+        return;
+      }
+
+      try {
+        const appointment = createAgendaAppointment({
+          professional: 'duda',
+          clientName,
+          whatsapp,
+          whatsappDigits,
+          procedureName,
+          appointmentDate: body.appointmentDate,
+          appointmentTime: body.appointmentTime,
+          notes,
+        });
+        res.status(201).json({ appointment });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('UNIQUE')) {
+          res.status(409).json({ error: 'Já existe um agendamento confirmado neste dia e horário.' });
+          return;
+        }
+        throw err;
+      }
+    }
+  );
+
+  app.post(
+    '/api/duda/agenda/confirm-request/:attendanceId',
+    requireAuth,
+    (req: AuthenticatedRequest, res: Response) => {
+      const attendanceId = req.params.attendanceId;
+      const body = req.body as {
+        appointmentDate?: unknown;
+        appointmentTime?: unknown;
+        procedureName?: unknown;
+        notes?: unknown;
+      };
+
+      if (!isValidISODate(body.appointmentDate)) {
+        res.status(400).json({ error: 'Informe uma data válida para o agendamento.' });
+        return;
+      }
+
+      if (!isValidManualTime(body.appointmentTime)) {
+        res.status(400).json({ error: 'Digite o horário definitivo no formato HH:MM (ex: 14:30).' });
+        return;
+      }
+
+      if (typeof body.procedureName !== 'string' || body.procedureName.trim().length < 2) {
+        res.status(400).json({ error: 'Selecione pelo menos um procedimento da Duda.' });
+        return;
+      }
+
+      const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 500) : '';
+
+      try {
+        const result = confirmAttendanceReturnToAgenda({
+          attendanceId,
+          expectedProfessional: 'duda',
+          appointmentDate: body.appointmentDate,
+          appointmentTime: body.appointmentTime,
+          procedureName: body.procedureName.trim().slice(0, 200),
+          notes,
+        });
+        res.status(201).json(result);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Erro ao confirmar agendamento.';
+        if (message.startsWith('NOT_FOUND:')) {
+          res.status(404).json({ error: message.replace('NOT_FOUND:', '') });
+          return;
+        }
+        if (message.startsWith('FORBIDDEN:')) {
+          res.status(403).json({ error: message.replace('FORBIDDEN:', '') });
+          return;
+        }
+        if (message.startsWith('BAD_REQUEST:')) {
+          res.status(400).json({ error: message.replace('BAD_REQUEST:', '') });
+          return;
+        }
+        if (message.startsWith('CONFLICT:') || message.includes('UNIQUE')) {
+          res.status(409).json({
+            error: message.startsWith('CONFLICT:')
+              ? message.replace('CONFLICT:', '')
+              : 'Já existe um agendamento confirmado para este dia e horário.',
+          });
+          return;
+        }
+        throw err;
+      }
+    }
+  );
+
+  app.patch(
+    '/api/duda/agenda/appointments/:id',
+    requireAuth,
+    (req: AuthenticatedRequest, res: Response) => {
+      const existing = getAgendaAppointmentById(req.params.id);
+      if (!existing || existing.professional !== 'duda') {
+        res.status(404).json({ error: 'Agendamento não encontrado.' });
+        return;
+      }
+      if (existing.status === 'cancelled') {
+        res.status(400).json({ error: 'Não é possível editar um agendamento cancelado.' });
+        return;
+      }
+
+      const body = req.body as {
+        clientName?: unknown;
+        whatsapp?: unknown;
+        procedureName?: unknown;
+        appointmentDate?: unknown;
+        appointmentTime?: unknown;
+        notes?: unknown;
+      };
+
+      const clientName =
+        typeof body.clientName === 'string' ? body.clientName.trim().slice(0, 120) : '';
+      if (clientName.length < 2) {
+        res.status(400).json({ error: 'Informe o nome completo da cliente.' });
+        return;
+      }
+
+      if (typeof body.whatsapp !== 'string') {
+        res.status(400).json({ error: 'Informe o WhatsApp da cliente.' });
+        return;
+      }
+      const whatsappDigits = extractDigits(body.whatsapp);
+      if (whatsappDigits.length < 10 || whatsappDigits.length > 13) {
+        res.status(400).json({ error: 'Informe o WhatsApp com DDD (10 ou 11 dígitos).' });
+        return;
+      }
+      const whatsapp = formatBrazilPhone(whatsappDigits);
+
+      const procedureName =
+        typeof body.procedureName === 'string' ? body.procedureName.trim().slice(0, 200) : '';
+      if (procedureName.length < 2) {
+        res.status(400).json({ error: 'Selecione ou informe o serviço.' });
+        return;
+      }
+
+      if (!isValidISODate(body.appointmentDate)) {
+        res.status(400).json({ error: 'Informe uma data válida.' });
+        return;
+      }
+
+      if (!isValidManualTime(body.appointmentTime)) {
+        res.status(400).json({ error: 'Digite um horário válido no formato HH:MM.' });
+        return;
+      }
+
+      const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 500) : '';
+
+      const occupant = findConfirmedSlotOwner(
+        'duda',
+        body.appointmentDate,
+        body.appointmentTime,
+        existing.id
+      );
+      if (occupant) {
+        res.status(409).json({
+          error: `Horário duplicado: ${occupant.clientName} já possui agendamento confirmado neste dia às ${body.appointmentTime}.`,
+        });
+        return;
+      }
+
+      try {
+        const appointment = updateAgendaAppointment(existing.id, {
+          clientName,
+          whatsapp,
+          whatsappDigits,
+          procedureName,
+          appointmentDate: body.appointmentDate,
+          appointmentTime: body.appointmentTime,
+          notes,
+        });
+        res.json({ appointment });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('UNIQUE')) {
+          res.status(409).json({ error: 'Já existe um agendamento confirmado neste dia e horário.' });
+          return;
+        }
+        throw err;
+      }
+    }
+  );
+
+  app.patch(
+    '/api/duda/agenda/appointments/:id/cancel',
+    requireAuth,
+    (req: AuthenticatedRequest, res: Response) => {
+      const existing = getAgendaAppointmentById(req.params.id);
+      if (!existing || existing.professional !== 'duda') {
+        res.status(404).json({ error: 'Agendamento não encontrado.' });
+        return;
+      }
+      const appointment = cancelAgendaAppointment(existing.id);
+      res.json({ appointment });
+    }
+  );
+
+  app.delete(
+    '/api/duda/agenda/appointments/:id',
+    requireAuth,
+    (req: AuthenticatedRequest, res: Response) => {
+      const existing = getAgendaAppointmentById(req.params.id);
+      if (!existing || existing.professional !== 'duda') {
+        res.status(404).json({ error: 'Agendamento não encontrado.' });
+        return;
+      }
+      deleteAgendaAppointment(existing.id);
+      res.json({ ok: true });
+    }
+  );
+
+  // ============================================================================
   // LAÍS ADMIN ROUTES (403 Forbidden for Duda)
   // ============================================================================
   app.get('/api/admin/dashboard', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
@@ -854,6 +1154,292 @@ async function startServer(): Promise<void> {
     }
     res.json({ ok: true });
   });
+
+  // ============================================================================
+  // LAÍS ADMIN AGENDA ROUTES (Access to both 'lais' and 'duda' agendas; 403 for Duda)
+  // ============================================================================
+  app.get('/api/admin/agenda', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const professional: Professional = req.query.professional === 'duda' ? 'duda' : 'lais';
+    const startDate = isValidISODate(req.query.startDate) ? req.query.startDate : undefined;
+    const endDate = isValidISODate(req.query.endDate) ? req.query.endDate : undefined;
+
+    const appointments = listAgendaAppointments({
+      professional,
+      startDate,
+      endDate,
+    });
+
+    res.json({ professional, appointments });
+  });
+
+  app.post(
+    '/api/admin/agenda/appointments',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const body = req.body as {
+        professional?: unknown;
+        clientName?: unknown;
+        whatsapp?: unknown;
+        procedureName?: unknown;
+        appointmentDate?: unknown;
+        appointmentTime?: unknown;
+        notes?: unknown;
+      };
+
+      const professional: Professional = body.professional === 'duda' ? 'duda' : 'lais';
+
+      if (typeof body.clientName !== 'string' || body.clientName.trim().length < 2) {
+        res.status(400).json({ error: 'Informe o nome completo da cliente.' });
+        return;
+      }
+      const clientName = body.clientName.trim().slice(0, 120);
+
+      if (typeof body.whatsapp !== 'string') {
+        res.status(400).json({ error: 'Informe o WhatsApp da cliente.' });
+        return;
+      }
+      const whatsappDigits = extractDigits(body.whatsapp);
+      if (whatsappDigits.length < 10 || whatsappDigits.length > 13) {
+        res.status(400).json({ error: 'Informe o WhatsApp com DDD (10 ou 11 dígitos).' });
+        return;
+      }
+      const whatsapp = formatBrazilPhone(whatsappDigits);
+
+      if (typeof body.procedureName !== 'string' || body.procedureName.trim().length < 2) {
+        res.status(400).json({ error: 'Selecione ou informe o serviço.' });
+        return;
+      }
+      const procedureName = body.procedureName.trim().slice(0, 200);
+
+      if (!isValidISODate(body.appointmentDate)) {
+        res.status(400).json({ error: 'Informe uma data válida.' });
+        return;
+      }
+
+      if (!isValidManualTime(body.appointmentTime)) {
+        res.status(400).json({ error: 'Digite um horário válido no formato HH:MM (ex: 14:30).' });
+        return;
+      }
+
+      const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 500) : '';
+
+      const occupant = findConfirmedSlotOwner(
+        professional,
+        body.appointmentDate,
+        body.appointmentTime
+      );
+      if (occupant) {
+        res.status(409).json({
+          error: `Horário duplicado: ${occupant.clientName} já possui agendamento confirmado neste dia às ${body.appointmentTime}.`,
+        });
+        return;
+      }
+
+      try {
+        const appointment = createAgendaAppointment({
+          professional,
+          clientName,
+          whatsapp,
+          whatsappDigits,
+          procedureName,
+          appointmentDate: body.appointmentDate,
+          appointmentTime: body.appointmentTime,
+          notes,
+        });
+        res.status(201).json({ appointment });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('UNIQUE')) {
+          res.status(409).json({ error: 'Já existe um agendamento confirmado neste dia e horário.' });
+          return;
+        }
+        throw err;
+      }
+    }
+  );
+
+  app.post(
+    '/api/admin/agenda/confirm-request/:attendanceId',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const attendanceId = req.params.attendanceId;
+      const body = req.body as {
+        appointmentDate?: unknown;
+        appointmentTime?: unknown;
+        procedureName?: unknown;
+        notes?: unknown;
+      };
+
+      if (!isValidISODate(body.appointmentDate)) {
+        res.status(400).json({ error: 'Informe uma data válida para o agendamento.' });
+        return;
+      }
+
+      if (!isValidManualTime(body.appointmentTime)) {
+        res.status(400).json({ error: 'Digite o horário definitivo no formato HH:MM (ex: 14:30).' });
+        return;
+      }
+
+      if (typeof body.procedureName !== 'string' || body.procedureName.trim().length < 2) {
+        res.status(400).json({ error: 'Selecione ou informe o procedimento.' });
+        return;
+      }
+
+      const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 500) : '';
+
+      try {
+        const result = confirmAttendanceReturnToAgenda({
+          attendanceId,
+          appointmentDate: body.appointmentDate,
+          appointmentTime: body.appointmentTime,
+          procedureName: body.procedureName.trim().slice(0, 200),
+          notes,
+        });
+        res.status(201).json(result);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Erro ao confirmar agendamento.';
+        if (message.startsWith('NOT_FOUND:')) {
+          res.status(404).json({ error: message.replace('NOT_FOUND:', '') });
+          return;
+        }
+        if (message.startsWith('BAD_REQUEST:')) {
+          res.status(400).json({ error: message.replace('BAD_REQUEST:', '') });
+          return;
+        }
+        if (message.startsWith('CONFLICT:') || message.includes('UNIQUE')) {
+          res.status(409).json({
+            error: message.startsWith('CONFLICT:')
+              ? message.replace('CONFLICT:', '')
+              : 'Já existe um agendamento confirmado neste dia e horário.',
+          });
+          return;
+        }
+        throw err;
+      }
+    }
+  );
+
+  app.patch(
+    '/api/admin/agenda/appointments/:id',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const existing = getAgendaAppointmentById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Agendamento não encontrado.' });
+        return;
+      }
+      if (existing.status === 'cancelled') {
+        res.status(400).json({ error: 'Não é possível editar um agendamento cancelado.' });
+        return;
+      }
+
+      const body = req.body as {
+        clientName?: unknown;
+        whatsapp?: unknown;
+        procedureName?: unknown;
+        appointmentDate?: unknown;
+        appointmentTime?: unknown;
+        notes?: unknown;
+      };
+
+      const clientName =
+        typeof body.clientName === 'string' ? body.clientName.trim().slice(0, 120) : '';
+      if (clientName.length < 2) {
+        res.status(400).json({ error: 'Informe o nome completo da cliente.' });
+        return;
+      }
+
+      if (typeof body.whatsapp !== 'string') {
+        res.status(400).json({ error: 'Informe o WhatsApp da cliente.' });
+        return;
+      }
+      const whatsappDigits = extractDigits(body.whatsapp);
+      if (whatsappDigits.length < 10 || whatsappDigits.length > 13) {
+        res.status(400).json({ error: 'Informe o WhatsApp com DDD (10 ou 11 dígitos).' });
+        return;
+      }
+      const whatsapp = formatBrazilPhone(whatsappDigits);
+
+      const procedureName =
+        typeof body.procedureName === 'string' ? body.procedureName.trim().slice(0, 200) : '';
+      if (procedureName.length < 2) {
+        res.status(400).json({ error: 'Selecione ou informe o serviço.' });
+        return;
+      }
+
+      if (!isValidISODate(body.appointmentDate)) {
+        res.status(400).json({ error: 'Informe uma data válida.' });
+        return;
+      }
+
+      if (!isValidManualTime(body.appointmentTime)) {
+        res.status(400).json({ error: 'Digite um horário válido no formato HH:MM.' });
+        return;
+      }
+
+      const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 500) : '';
+
+      const occupant = findConfirmedSlotOwner(
+        existing.professional,
+        body.appointmentDate,
+        body.appointmentTime,
+        existing.id
+      );
+      if (occupant) {
+        res.status(409).json({
+          error: `Horário duplicado: ${occupant.clientName} já possui agendamento confirmado neste dia às ${body.appointmentTime}.`,
+        });
+        return;
+      }
+
+      try {
+        const appointment = updateAgendaAppointment(existing.id, {
+          clientName,
+          whatsapp,
+          whatsappDigits,
+          procedureName,
+          appointmentDate: body.appointmentDate,
+          appointmentTime: body.appointmentTime,
+          notes,
+        });
+        res.json({ appointment });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.includes('UNIQUE')) {
+          res.status(409).json({ error: 'Já existe um agendamento confirmado neste dia e horário.' });
+          return;
+        }
+        throw err;
+      }
+    }
+  );
+
+  app.patch(
+    '/api/admin/agenda/appointments/:id/cancel',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const existing = getAgendaAppointmentById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Agendamento não encontrado.' });
+        return;
+      }
+      const appointment = cancelAgendaAppointment(existing.id);
+      res.json({ appointment });
+    }
+  );
+
+  app.delete(
+    '/api/admin/agenda/appointments/:id',
+    requireAdmin,
+    (req: AuthenticatedRequest, res: Response) => {
+      const deleted = deleteAgendaAppointment(req.params.id);
+      if (!deleted) {
+        res.status(404).json({ error: 'Agendamento não encontrado.' });
+        return;
+      }
+      res.json({ ok: true });
+    }
+  );
 
   // Serve frontend (Vite in dev, dist/ in production)
   if (process.env.NODE_ENV !== 'production') {

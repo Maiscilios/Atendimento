@@ -11,7 +11,12 @@ import type {
   ServiceItem,
   UserRole,
 } from '../src/shared/catalog.ts';
-import type { PayoutStatus, SetupStatus } from '../src/shared/panelTypes.ts';
+import type {
+  AgendaAppointment,
+  AgendaAppointmentStatus,
+  PayoutStatus,
+  SetupStatus,
+} from '../src/shared/panelTypes.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) {
@@ -78,6 +83,34 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_attendances_whatsapp
     ON attendances(whatsapp_digits);
+
+  CREATE TABLE IF NOT EXISTS agenda_appointments (
+    id TEXT PRIMARY KEY,
+    professional TEXT NOT NULL CHECK(professional IN ('lais', 'duda')),
+    source_attendance_id TEXT,
+    client_name TEXT NOT NULL,
+    whatsapp TEXT NOT NULL,
+    whatsapp_digits TEXT NOT NULL,
+    procedure_name TEXT NOT NULL,
+    appointment_date TEXT NOT NULL,
+    appointment_time TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('confirmed', 'cancelled')) DEFAULT 'confirmed',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (source_attendance_id) REFERENCES attendances(id) ON DELETE SET NULL
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_agenda_unique_slot
+    ON agenda_appointments(professional, appointment_date, appointment_time)
+    WHERE status = 'confirmed';
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_agenda_unique_source
+    ON agenda_appointments(source_attendance_id)
+    WHERE source_attendance_id IS NOT NULL AND status = 'confirmed';
+
+  CREATE INDEX IF NOT EXISTS idx_agenda_prof_date
+    ON agenda_appointments(professional, appointment_date ASC, appointment_time ASC);
 `);
 
 // Safe migration for existing databases without losing any attendance records
@@ -500,3 +533,306 @@ export function upsertCommissionPayoutStatus(
 
   return getCommissionPayoutByDate(date)!;
 }
+
+// ============================================================================
+// AGENDA APPOINTMENTS (Strictly isolated per professional: 'lais' | 'duda')
+// ============================================================================
+
+interface DbAgendaRow {
+  id: string;
+  professional: Professional;
+  source_attendance_id: string | null;
+  client_name: string;
+  whatsapp: string;
+  whatsapp_digits: string;
+  procedure_name: string;
+  appointment_date: string;
+  appointment_time: string;
+  notes: string;
+  status: AgendaAppointmentStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapAgendaRow(row: DbAgendaRow): AgendaAppointment {
+  return {
+    id: row.id,
+    professional: row.professional,
+    sourceAttendanceId: row.source_attendance_id,
+    clientName: row.client_name,
+    whatsapp: row.whatsapp,
+    whatsappDigits: row.whatsapp_digits,
+    procedureName: row.procedure_name,
+    appointmentDate: row.appointment_date,
+    appointmentTime: row.appointment_time,
+    notes: row.notes,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function listAgendaAppointments(options: {
+  professional: Professional;
+  startDate?: string;
+  endDate?: string;
+  includeCancelled?: boolean;
+}): AgendaAppointment[] {
+  const clauses: string[] = ['professional = ?'];
+  const params: Array<string> = [options.professional];
+
+  if (!options.includeCancelled) {
+    clauses.push("status = 'confirmed'");
+  }
+  if (options.startDate) {
+    clauses.push('appointment_date >= ?');
+    params.push(options.startDate);
+  }
+  if (options.endDate) {
+    clauses.push('appointment_date <= ?');
+    params.push(options.endDate);
+  }
+
+  const sql = `
+    SELECT * FROM agenda_appointments
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY appointment_date ASC, appointment_time ASC, created_at ASC
+  `;
+  const rows = db.prepare(sql).all(...params) as DbAgendaRow[];
+  return rows.map(mapAgendaRow);
+}
+
+export function getAgendaAppointmentById(id: string): AgendaAppointment | null {
+  const row = db
+    .prepare('SELECT * FROM agenda_appointments WHERE id = ?')
+    .get(id) as DbAgendaRow | undefined;
+  return row ? mapAgendaRow(row) : null;
+}
+
+export function findConfirmedSlotOwner(
+  professional: Professional,
+  appointmentDate: string,
+  appointmentTime: string,
+  excludeId?: string
+): AgendaAppointment | null {
+  const row = excludeId
+    ? (db
+        .prepare(
+          `
+          SELECT * FROM agenda_appointments
+          WHERE professional = ?
+            AND appointment_date = ?
+            AND appointment_time = ?
+            AND status = 'confirmed'
+            AND id != ?
+          `
+        )
+        .get(professional, appointmentDate, appointmentTime, excludeId) as DbAgendaRow | undefined)
+    : (db
+        .prepare(
+          `
+          SELECT * FROM agenda_appointments
+          WHERE professional = ?
+            AND appointment_date = ?
+            AND appointment_time = ?
+            AND status = 'confirmed'
+          `
+        )
+        .get(professional, appointmentDate, appointmentTime) as DbAgendaRow | undefined);
+
+  return row ? mapAgendaRow(row) : null;
+}
+
+export interface CreateAgendaInput {
+  professional: Professional;
+  sourceAttendanceId?: string | null;
+  clientName: string;
+  whatsapp: string;
+  whatsappDigits: string;
+  procedureName: string;
+  appointmentDate: string;
+  appointmentTime: string;
+  notes: string;
+}
+
+export function createAgendaAppointment(input: CreateAgendaInput): AgendaAppointment {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `
+    INSERT INTO agenda_appointments (
+      id, professional, source_attendance_id, client_name, whatsapp, whatsapp_digits,
+      procedure_name, appointment_date, appointment_time, notes, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)
+    `
+  ).run(
+    id,
+    input.professional,
+    input.sourceAttendanceId ?? null,
+    input.clientName,
+    input.whatsapp,
+    input.whatsappDigits,
+    input.procedureName,
+    input.appointmentDate,
+    input.appointmentTime,
+    input.notes,
+    now,
+    now
+  );
+
+  return getAgendaAppointmentById(id)!;
+}
+
+export function confirmAttendanceReturnToAgenda(input: {
+  attendanceId: string;
+  expectedProfessional?: Professional;
+  appointmentDate: string;
+  appointmentTime: string;
+  procedureName: string;
+  notes?: string;
+}): {
+  appointment: AgendaAppointment;
+  attendance: AttendanceRecord;
+} {
+  const run = db.transaction(() => {
+    const attendance = getAttendanceById(input.attendanceId);
+    if (!attendance) {
+      throw new Error('NOT_FOUND:Solicitação de retorno não encontrada.');
+    }
+    if (input.expectedProfessional && attendance.professional !== input.expectedProfessional) {
+      throw new Error('FORBIDDEN:Você só pode adicionar à agenda os retornos das suas próprias clientes.');
+    }
+    if (attendance.returnOption === 'no_schedule') {
+      throw new Error('BAD_REQUEST:Este atendimento não possui solicitação de retorno.');
+    }
+
+    const existingForSource = db
+      .prepare(
+        "SELECT * FROM agenda_appointments WHERE source_attendance_id = ? AND status = 'confirmed'"
+      )
+      .get(input.attendanceId) as DbAgendaRow | undefined;
+
+    if (existingForSource) {
+      throw new Error(
+        'CONFLICT:Esta solicitação já foi confirmada e adicionada à agenda.'
+      );
+    }
+
+    const existingOwner = findConfirmedSlotOwner(
+      attendance.professional,
+      input.appointmentDate,
+      input.appointmentTime
+    );
+    if (existingOwner) {
+      throw new Error(
+        `CONFLICT:Já existe um agendamento confirmado para ${existingOwner.clientName} neste dia e horário (${input.appointmentTime}).`
+      );
+    }
+
+    const appointment = createAgendaAppointment({
+      professional: attendance.professional,
+      sourceAttendanceId: attendance.id,
+      clientName: attendance.clientName,
+      whatsapp: attendance.whatsapp,
+      whatsappDigits: attendance.whatsappDigits,
+      procedureName: input.procedureName.trim(),
+      appointmentDate: input.appointmentDate,
+      appointmentTime: input.appointmentTime,
+      notes: input.notes?.trim() ?? '',
+    });
+
+    const updatedAttendance = updateAttendanceReturnStatus(attendance.id, 'confirmed')!;
+    return { appointment, attendance: updatedAttendance };
+  });
+
+  return run();
+}
+
+export function updateAgendaAppointment(
+  id: string,
+  updates: {
+    clientName: string;
+    whatsapp: string;
+    whatsappDigits: string;
+    procedureName: string;
+    appointmentDate: string;
+    appointmentTime: string;
+    notes: string;
+  }
+): AgendaAppointment | null {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `
+      UPDATE agenda_appointments
+      SET client_name = ?,
+          whatsapp = ?,
+          whatsapp_digits = ?,
+          procedure_name = ?,
+          appointment_date = ?,
+          appointment_time = ?,
+          notes = ?,
+          updated_at = ?
+      WHERE id = ?
+      `
+    )
+    .run(
+      updates.clientName,
+      updates.whatsapp,
+      updates.whatsappDigits,
+      updates.procedureName,
+      updates.appointmentDate,
+      updates.appointmentTime,
+      updates.notes,
+      now,
+      id
+    );
+
+  if (result.changes === 0) return null;
+  return getAgendaAppointmentById(id);
+}
+
+export function cancelAgendaAppointment(id: string): AgendaAppointment | null {
+  const run = db.transaction(() => {
+    const existing = getAgendaAppointmentById(id);
+    if (!existing) return null;
+
+    const now = new Date().toISOString();
+    db.prepare("UPDATE agenda_appointments SET status = 'cancelled', updated_at = ? WHERE id = ?").run(
+      now,
+      id
+    );
+
+    if (existing.sourceAttendanceId) {
+      const source = getAttendanceById(existing.sourceAttendanceId);
+      if (source && source.returnOption !== 'no_schedule') {
+        updateAttendanceReturnStatus(source.id, 'waiting');
+      }
+    }
+
+    return getAgendaAppointmentById(id);
+  });
+
+  return run();
+}
+
+export function deleteAgendaAppointment(id: string): boolean {
+  const run = db.transaction(() => {
+    const existing = getAgendaAppointmentById(id);
+    if (!existing) return false;
+
+    const info = db.prepare('DELETE FROM agenda_appointments WHERE id = ?').run(id);
+    if (info.changes > 0 && existing.sourceAttendanceId) {
+      const source = getAttendanceById(existing.sourceAttendanceId);
+      if (source && source.returnOption !== 'no_schedule') {
+        updateAttendanceReturnStatus(source.id, 'waiting');
+      }
+    }
+    return info.changes > 0;
+  });
+
+  return run();
+}
+
+
